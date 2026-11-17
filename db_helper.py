@@ -14,14 +14,14 @@ class DBHelper:
     def create_tables(self):
         with self.lock, self.conn:
             self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    salt TEXT NOT NULL,
-                    skin TEXT DEFAULT 'RK800'
-                )
-            """)
+                            CREATE TABLE IF NOT EXISTS users (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                username TEXT UNIQUE NOT NULL,
+                                password_hash TEXT NOT NULL,
+                                salt TEXT NOT NULL,
+                                skin TEXT DEFAULT 'RK800'
+                            )
+                        """)
 
     @staticmethod
     def _hash(password, salt):
@@ -58,3 +58,4 @@ class DBHelper:
             self.conn.execute(
                 "UPDATE users SET skin = ? WHERE username = ?", (skin_name, username)
             )
+
