@@ -5,11 +5,12 @@ import random
 import time
 from db_helper import DBHelper
 
-HOST = '127.0.0.1'
+HOST = '0.0.0.0'
 PORT = 5555
 
 DEFAULT_SETTINGS = {"size": 6, "killers": 1, "detectives": 1, "quests": 3}
-
+BOT_QUEST_SECONDS = 5        # сколько бот "выполняет" задание
+BOT_THINK_RANGE = (2, 5)     # пауза между заданиями бота (сек)
 # номер комнаты: вместимость
 # 1 - башня, 2 - центр, 3 - правая, 4 - терраса, 5 - нижняя
 QUEST_ROOMS = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
@@ -28,6 +29,7 @@ class CyberServer:
         self.lobbies = {}          # code -> dict
         self.lobby_lock = threading.Lock()
         print(f"[SERVER STARTED] Сервер запущен на {HOST}:{PORT}...")
+        threading.Thread(target=self.bot_loop, daemon=True).start()
 
     # ---------- вспомогательное ----------
     @staticmethod
@@ -47,18 +49,22 @@ class CyberServer:
         return int(elapsed // ROUND_SECONDS) + 1, ROUND_SECONDS - int(elapsed % ROUND_SECONDS)
 
     @staticmethod
+    @staticmethod
+    def participants(lobby):
+        """Люди + боты (боты появляются после старта)."""
+        return list(lobby["players"]) + list(lobby.get("bots", []))
+
+    @staticmethod
     def check_win(lobby):
-        """Мирные побеждают, когда шкала заданий заполнена."""
         if not lobby.get("started") or lobby.get("winner"):
             return
         roles = lobby.get("roles", {})
         done = lobby.get("done", {})
-        peace = [p for p in lobby["players"] if roles.get(p) != "killer"]
+        peace = [p for p in CyberServer.participants(lobby) if roles.get(p) != "killer"]
         total = len(peace) * lobby["quests"]
         if total > 0 and sum(len(done.get(p, [])) for p in peace) >= total:
             lobby["winner"] = "peaceful"
             print("[GAME] Мирные победили!")
-
     def lobby_state(self, code, lobby, user):
         self.check_win(lobby)
         started = lobby.get("started", False)
@@ -74,8 +80,8 @@ class CyberServer:
         for b in bots:
             slots.append({"name": b, "bot": True, "host": False})
 
-        # шкала считает только заданий неубийц (людей)
-        peace = [p for p in humans if roles.get(p) != "killer"]
+        # было: peace = [p for p in humans if roles.get(p) != "killer"]
+        peace = [p for p in self.participants(lobby) if roles.get(p) != "killer"]
         progress = {
             "done": sum(len(done.get(p, [])) for p in peace),
             "total": len(peace) * lobby["quests"],
@@ -237,8 +243,11 @@ class CyberServer:
                         else:
                             roles[n] = "peaceful"
                     lobby.update(started=True, bots=bots, roles=roles,
-                                 done={p: [] for p in humans},
-                                 round_start=time.time(), checks={})
+                                 done={p: [] for p in names},  # было: humans
+                                 round_start=time.time(), checks={},
+                                 bot_state={b: {"room": None,
+                                                "next_at": time.time() + random.uniform(*BOT_THINK_RANGE)}
+                                            for b in bots})
                     print(f"[LOBBY] {user} запустил игру в лобби {code}")
                     print(f"[ROLES] {roles}")
                 return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
@@ -339,6 +348,55 @@ class CyberServer:
                 return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
 
         return {"status": False, "msg": "Неизвестное действие"}
+
+    def bot_tick(self):
+        now = time.time()
+        with self.lobby_lock:
+            for lobby in list(self.lobbies.values()):
+                if not lobby.get("started") or lobby.get("winner"):
+                    continue
+                rooms = lobby.setdefault("rooms", {})
+                done = lobby.setdefault("done", {})
+                for bot, st in lobby.get("bot_state", {}).items():
+                    if now < st["next_at"]:
+                        continue
+
+                    rid = st["room"]
+                    if rid is not None:
+                        # прошло 5 секунд -> "complete_quest" + освободить комнату
+                        if bot in rooms.get(rid, []):
+                            rooms[rid].remove(bot)
+                        mine = done.setdefault(bot, [])
+                        if rid not in mine and len(mine) < lobby["quests"]:
+                            mine.append(rid)
+                            print(f"[BOT QUEST] {bot} выполнил задание в комнате {rid}")
+                        st["room"] = None
+                        st["next_at"] = now + random.uniform(*BOT_THINK_RANGE)
+                        self.check_win(lobby)
+                        if lobby.get("winner"):
+                            break
+                        continue
+
+                    # бот свободен -> ищем пустую комнату 0/1, где он ещё не был
+                    mine = done.setdefault(bot, [])
+                    if len(mine) >= lobby["quests"]:
+                        continue
+                    free = [r for r, cap in QUEST_ROOMS.items()
+                            if cap == 1 and r not in mine and not rooms.get(r)]
+                    if not free:
+                        continue
+                    rid = random.choice(free)
+                    rooms.setdefault(rid, []).append(bot)  # "замок" комнаты
+                    st["room"] = rid
+                    st["next_at"] = now + BOT_QUEST_SECONDS
+
+    def bot_loop(self):
+        while True:
+            time.sleep(1)
+            try:
+                self.bot_tick()
+            except Exception as e:
+                print(f"[BOT ERROR] {e}")
 
     # ---------- клиенты ----------
     def handle_client(self, conn, addr):
