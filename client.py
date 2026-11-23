@@ -1,5 +1,6 @@
 import pygame
 import sys
+import os
 import socket
 import json
 import random
@@ -41,6 +42,55 @@ ROLE_INFO = {
     "peaceful": ("ANDROID", COLOR_HUD,
                  "You are a loyal android. Do your tasks in the rooms. When all androids finish their tasks, you win."),
 }
+
+# ---------------- КОСТЮМЫ ----------------
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+ASSET_FILES = {
+    "body": "body.png",
+    "hair": "hair.png",
+    "clothes": "clothes.png",
+    "led_blue": "led_blue.png",
+    "led_yellow": "led_yellow.png",
+    "led_red": "led_red.png",
+}
+# плитки выбора (ключ, подпись)
+COSTUME_ITEMS = [
+    ("hair", "Hair"),
+    ("clothes", "Clothes"),
+    ("led_blue", "LED blue"),
+    ("led_yellow", "LED yellow"),
+    ("led_red", "LED red"),
+]
+PREVIEW_SCALE = 0.28                       # масштаб холста 1920x1920
+PREVIEW_CROP = pygame.Rect(110, 30, 360, 480)   # какая часть холста видна
+PREVIEW_POS = (70, 100)
+
+
+def load_assets():
+    """Загружаем слои костюма из папки assets."""
+    layers, thumbs, missing = {}, {}, []
+    for key, fname in ASSET_FILES.items():
+        path = os.path.join(ASSET_DIR, fname)
+        try:
+            img = pygame.image.load(path).convert_alpha()
+        except Exception:
+            missing.append(fname)
+            continue
+        w, h = img.get_size()
+        layers[key] = pygame.transform.smoothscale(
+            img, (max(1, int(w * PREVIEW_SCALE)), max(1, int(h * PREVIEW_SCALE))))
+
+        # миниатюра: обрезаем по содержимому и вписываем в 90x70
+        box = img.get_bounding_rect()
+        if box.w > 0 and box.h > 0:
+            crop = img.subsurface(box).copy()
+            k = min(90 / box.w, 70 / box.h)
+            thumbs[key] = pygame.transform.smoothscale(
+                crop, (max(1, int(box.w * k)), max(1, int(box.h * k))))
+    return layers, thumbs, missing
+
+
+ASSET_LAYERS, ASSET_THUMBS, ASSET_MISSING = load_assets()
 
 # ---------------- КАРТА ----------------
 MAP_S = 0.737
@@ -142,6 +192,7 @@ class CyberClient:
         self.current_screen = "MAIN"
         self.user = ""
         self.skin = "RK800"
+        self.outfit = {"hair": True, "clothes": True, "led": None}
         self.exit_confirm = False
 
         self.input_user = ""
@@ -226,6 +277,39 @@ class CyberClient:
         self.go("MAIN")
         self.notice = "Связь с сервером потеряна!"
 
+    # ---------- костюм ----------
+    def set_outfit_from_skin(self, skin):
+        """Разбираем строку скина вида 'hair,clothes,led_blue'."""
+        if not skin or skin == "RK800":
+            self.outfit = {"hair": True, "clothes": True, "led": None}
+            return
+        parts = skin.split(",")
+        self.outfit = {
+            "hair": "hair" in parts,
+            "clothes": "clothes" in parts,
+            "led": next((p for p in parts if p.startswith("led_")), None),
+        }
+
+    def skin_string(self):
+        parts = [k for k in ("hair", "clothes") if self.outfit[k]]
+        if self.outfit["led"]:
+            parts.append(self.outfit["led"])
+        return ",".join(parts) or "none"
+
+    def costume_on(self, key):
+        if key in ("hair", "clothes"):
+            return self.outfit[key]
+        return self.outfit["led"] == key
+
+    def toggle_costume(self, key):
+        if key in ("hair", "clothes"):
+            self.outfit[key] = not self.outfit[key]
+        else:
+            self.outfit["led"] = None if self.outfit["led"] == key else key
+        self.skin = self.skin_string()
+        if self.user:
+            self.send_request({"action": "update_skin", "skin": self.skin})
+
     # ---------- логика ----------
     def ensure_user(self):
         if self.user:
@@ -249,6 +333,7 @@ class CyberClient:
         elif res.get("status"):
             self.user = res.get("username", self.input_user)
             self.skin = res.get("skin") or "RK800"
+            self.set_outfit_from_skin(self.skin)
             self.go("MAIN")
         else:
             self.login_msg = res.get("msg", "Ошибка входа")
@@ -528,15 +613,70 @@ class CyberClient:
         if self.room_msg and pygame.time.get_ticks() < self.room_msg_until:
             SCREEN.blit(FONT.render(self.room_msg, True, COLOR_DEV_RED), (x, y))
 
-    def draw_android_2d(self, x, y):
-        pygame.draw.ellipse(SCREEN, COLOR_HUD, (x - 60, y + 160, 120, 30), 2)
-        pygame.draw.line(SCREEN, COLOR_TEXT, (x, y), (x, y + 100), 4)
-        pygame.draw.circle(SCREEN, COLOR_TEXT, (x, y - 20), 18, 2)
-        pygame.draw.circle(SCREEN, COLOR_HUD, (x + 12, y - 24), 4)
-        pygame.draw.line(SCREEN, COLOR_TEXT, (x, y + 30), (x - 30, y + 70), 3)
-        pygame.draw.line(SCREEN, COLOR_TEXT, (x, y + 30), (x + 30, y + 70), 3)
-        pygame.draw.line(SCREEN, COLOR_TEXT, (x, y + 100), (x - 25, y + 160), 3)
-        pygame.draw.line(SCREEN, COLOR_TEXT, (x, y + 100), (x + 25, y + 160), 3)
+    def draw_customize(self):
+        # рамка с андроидом слева
+        pygame.draw.rect(SCREEN, (12, 22, 36), (60, 90, 380, 500))
+        pygame.draw.rect(SCREEN, COLOR_HUD, (60, 90, 380, 500), 2)
+
+        if "body" not in ASSET_LAYERS:
+            t = SMALL_FONT.render("body.png not found", True, COLOR_DEV_RED)
+            SCREEN.blit(t, (250 - t.get_width() // 2, 330))
+        else:
+            order = ["body"]
+            if self.outfit["clothes"]:
+                order.append("clothes")
+            if self.outfit["hair"]:
+                order.append("hair")
+            if self.outfit["led"]:
+                order.append(self.outfit["led"])
+            for key in order:
+                layer = ASSET_LAYERS.get(key)
+                if layer:
+                    SCREEN.blit(layer, PREVIEW_POS, PREVIEW_CROP)
+
+        # плитки выбора справа
+        SCREEN.blit(FONT.render("Costumes", True, COLOR_HUD), (500, 95))
+        SCREEN.blit(SMALL_FONT.render("Click an item to put it on / take it off",
+                                      True, COLOR_DIM), (500, 118))
+
+        mouse = pygame.mouse.get_pos()
+        for i, (key, label) in enumerate(COSTUME_ITEMS):
+            x = 500 + (i % 3) * 150
+            y = 150 + (i // 3) * 160
+            rect = pygame.Rect(x, y, 130, 140)
+            on = self.costume_on(key)
+            hover = rect.collidepoint(mouse) and not self.exit_confirm
+
+            pygame.draw.rect(SCREEN, COLOR_ACTIVE if on else COLOR_DARK_BOX, rect)
+            pygame.draw.rect(SCREEN, (38, 58, 82), (x + 10, y + 10, 110, 90))
+            thumb = ASSET_THUMBS.get(key)
+            if thumb:
+                SCREEN.blit(thumb, (x + 65 - thumb.get_width() // 2,
+                                    y + 55 - thumb.get_height() // 2))
+            border = COLOR_GREEN if on else (COLOR_DEV_RED if hover else COLOR_HUD)
+            pygame.draw.rect(SCREEN, border, rect, 3 if (on or hover) else 2)
+
+            t = SMALL_FONT.render(label, True, COLOR_TEXT)
+            SCREEN.blit(t, (rect.centerx - t.get_width() // 2, y + 110))
+
+            if (self.click_pos and not self.exit_confirm
+                    and rect.collidepoint(self.click_pos)):
+                self.click_pos = None
+                self.toggle_costume(key)
+
+        if ASSET_MISSING:
+            SCREEN.blit(SMALL_FONT.render("Missing files in the assets folder:",
+                                          True, COLOR_DEV_RED), (500, 475))
+            yy = 497
+            for line in wrap_lines(", ".join(ASSET_MISSING), SMALL_FONT, 450):
+                SCREEN.blit(SMALL_FONT.render(line, True, COLOR_DEV_RED), (500, yy))
+                yy += 20
+        elif not self.user:
+            SCREEN.blit(SMALL_FONT.render("Log in to save your costume.",
+                                          True, COLOR_DIM), (500, 475))
+
+        if self.draw_button("Back", 400, 598, 200, 45):
+            self.go("MAIN")
 
     def draw_story(self):
         y = 90
@@ -830,16 +970,7 @@ class CyberClient:
                 self.go("MAIN")
 
         elif self.current_screen == "CUSTOMIZE":
-            self.draw_android_2d(250, 250)
-            for r in range(3):
-                for c in range(3):
-                    bx = 500 + c * 80
-                    by = 180 + r * 80
-                    pygame.draw.rect(SCREEN, COLOR_DARK_BOX, (bx, by, 70, 70))
-                    pygame.draw.rect(SCREEN, COLOR_HUD, (bx, by, 70, 70), 1)
-
-            if self.draw_button("Back", 400, 520, 200, 45):
-                self.go("MAIN")
+            self.draw_customize()
 
         elif self.current_screen == "STORY":
             self.draw_story()
