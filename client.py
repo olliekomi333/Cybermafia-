@@ -36,12 +36,14 @@ STORY_TEXT = [
 # роль -> (название, цвет, описание)
 ROLE_INFO = {
     "killer": ("DEVIANT", COLOR_DEV_RED,
-               "You are the deviant. Steal critical data from Kamski's house while the androids are busy. In the rooms you have special tasks: hack the terminals."),
+               "You are the deviant. Steal critical data from Kamski's house while the androids are busy. In the rooms you have special tasks: hack the terminals. You can kill an android inside a room, even a full one: the victim's place is yours. One kill per round."),
     "detective": ("DETECTIVE", COLOR_YELLOW,
                   "You are the detective. Do your tasks like everyone else. Once per round you can check one player and find out if he is a deviant."),
     "peaceful": ("ANDROID", COLOR_HUD,
-                 "You are a loyal android. Do your tasks in the rooms. When all androids finish their tasks, you win."),
+                 "You are a loyal android. Do your tasks in the rooms. If you find a body, report it. When all androids finish their tasks or all deviants are ejected, you win."),
 }
+
+ROOM_NAMES = {1: "Tower", 2: "Center", 3: "East wing", 4: "Terrace", 5: "South wing"}
 
 # ---------------- КОСТЮМЫ ----------------
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -53,7 +55,6 @@ ASSET_FILES = {
     "led_yellow": "led_yellow.png",
     "led_red": "led_red.png",
 }
-# плитки выбора (ключ, подпись)
 COSTUME_ITEMS = [
     ("hair", "Hair"),
     ("clothes", "Clothes"),
@@ -61,8 +62,8 @@ COSTUME_ITEMS = [
     ("led_yellow", "LED yellow"),
     ("led_red", "LED red"),
 ]
-PREVIEW_SCALE = 0.28                       # масштаб холста 1920x1920
-PREVIEW_CROP = pygame.Rect(110, 30, 360, 480)   # какая часть холста видна
+PREVIEW_SCALE = 0.28
+PREVIEW_CROP = pygame.Rect(110, 30, 360, 480)
 PREVIEW_POS = (70, 100)
 
 
@@ -80,7 +81,6 @@ def load_assets():
         layers[key] = pygame.transform.smoothscale(
             img, (max(1, int(w * PREVIEW_SCALE)), max(1, int(h * PREVIEW_SCALE))))
 
-        # миниатюра: обрезаем по содержимому и вписываем в 90x70
         box = img.get_bounding_rect()
         if box.w > 0 and box.h > 0:
             crop = img.subsurface(box).copy()
@@ -155,6 +155,19 @@ def wrap_lines(text, font, max_w):
     return lines
 
 
+def draw_shadow(x, y, filled, edge):
+    """Силуэт человека: закрашенный (занято) или только контур (свободно)."""
+    if filled:
+        pygame.draw.circle(SCREEN, (4, 7, 12), (x + 11, y + 6), 6)
+        pygame.draw.ellipse(SCREEN, (4, 7, 12), (x + 2, y + 14, 18, 22))
+        pygame.draw.circle(SCREEN, edge, (x + 11, y + 6), 6, 1)
+        pygame.draw.ellipse(SCREEN, edge, (x + 2, y + 14, 18, 22), 1)
+    else:
+        dim = (70, 92, 115)
+        pygame.draw.circle(SCREEN, dim, (x + 11, y + 6), 6, 1)
+        pygame.draw.ellipse(SCREEN, dim, (x + 2, y + 14, 18, 22), 1)
+
+
 def draw_map():
     wt = max(3, int(8 * MAP_S))
 
@@ -217,9 +230,12 @@ class CyberClient:
         self.room_msg = ""
         self.room_msg_until = 0
 
-        # роли
+        # роли, убийства, голосование
         self.role_seen = False
+        self.dead_seen = False
         self.check_open = False
+        self.kill_room = None
+        self.chat_input = ""
 
         self.try_connect()
 
@@ -265,9 +281,12 @@ class CyberClient:
     def go(self, screen):
         self.current_screen = screen
         self.quest_room = None
+        self.kill_room = None
         self.check_open = False
         if screen != "GAME":
             self.role_seen = False
+            self.dead_seen = False
+            self.chat_input = ""
         self.notice = ""
         self.login_msg = ""
         self.join_msg = ""
@@ -395,7 +414,8 @@ class CyberClient:
 
     def poll_lobby(self):
         now = pygame.time.get_ticks()
-        if now - self.last_poll > 1000:
+        interval = 500 if (self.lobby and self.lobby.get("meeting")) else 1000
+        if now - self.last_poll > interval:
             self.last_poll = now
             self.apply_lobby_response(self.send_request({"action": "get_lobby"}))
 
@@ -410,6 +430,12 @@ class CyberClient:
     def show_msg(self, text):
         self.room_msg = text
         self.room_msg_until = pygame.time.get_ticks() + 2500
+
+    def room_players(self, rid):
+        for r in self.lobby["rooms"]:
+            if r["id"] == rid:
+                return r["players"]
+        return []
 
     # ---------- задания в комнатах ----------
     def try_enter_room(self, rid):
@@ -455,17 +481,81 @@ class CyberClient:
         else:
             self.show_msg(res.get("msg", "Ошибка"))
 
+    # ---------- убийство, репорт, голосование ----------
+    def do_kill(self, rid, target):
+        res = self.send_request({"action": "kill", "room": rid, "target": target})
+        if res is None:
+            self.connection_lost()
+            return
+        if res.get("status"):
+            self.lobby = res["lobby"]
+            self.kill_room = None
+            if res.get("entered") and self.quest_room != rid:
+                self.open_quest(rid)
+        else:
+            self.kill_room = None
+            self.show_msg(res.get("msg", "Ошибка"))
+
+    def do_report(self):
+        res = self.send_request({"action": "report"})
+        if res is None:
+            self.connection_lost()
+        elif res.get("status"):
+            self.lobby = res["lobby"]
+            self.quest_room = None
+            self.kill_room = None
+        else:
+            self.show_msg(res.get("msg", "Ошибка"))
+
+    def do_vote(self, target):
+        res = self.send_request({"action": "vote", "target": target})
+        if res is None:
+            self.connection_lost()
+        elif res.get("status"):
+            self.lobby = res["lobby"]
+        else:
+            self.show_msg(res.get("msg", "Ошибка"))
+
+    def send_chat(self):
+        text = self.chat_input.strip()
+        if not text:
+            return
+        self.chat_input = ""
+        res = self.send_request({"action": "chat", "text": text})
+        if res is None:
+            self.connection_lost()
+        elif res.get("status"):
+            self.lobby = res["lobby"]
+        else:
+            self.show_msg(res.get("msg", "Ошибка"))
+
     def draw_quest(self):
-        is_killer = self.lobby.get("my_role") == "killer"
+        lob = self.lobby
+        rid = self.quest_room
+        is_killer = lob.get("my_role") == "killer"
+        alive = lob.get("alive", True)
+        mine = lob.get("my_done", [])
+        can_task = self.quest_done or (alive and rid not in mine and len(mine) < lob["quests"])
+        body_here = rid in lob.get("body_rooms", [])
 
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 170))
         SCREEN.blit(overlay, (0, 0))
-        pygame.draw.rect(SCREEN, (12, 22, 36), (250, 120, 500, 400))
+        pygame.draw.rect(SCREEN, (12, 22, 36), (250, 100, 500, 440))
         pygame.draw.rect(SCREEN, COLOR_DEV_RED if is_killer else COLOR_HUD,
-                         (250, 120, 500, 400), 2)
+                         (250, 100, 500, 440), 2)
 
-        if is_killer:
+        if body_here:
+            SCREEN.blit(FONT.render("A BODY IS HERE!", True, COLOR_DEV_RED), (270, 106))
+        else:
+            SCREEN.blit(SMALL_FONT.render(ROOM_NAMES.get(rid, "Room"), True, COLOR_DIM),
+                        (270, 108))
+
+        if not can_task:
+            SCREEN.blit(FONT.render("Nothing to do here", True, COLOR_HUD), (270, 140))
+            SCREEN.blit(FONT.render("You can still look around and report a body",
+                                    True, COLOR_DIM), (270, 163))
+        elif is_killer:
             SCREEN.blit(FONT.render("SPECIAL TASK: Steal data from the terminal",
                                     True, COLOR_DEV_RED), (270, 140))
             SCREEN.blit(FONT.render("Click the nodes in order 1 to 5",
@@ -481,8 +571,19 @@ class CyberClient:
         pygame.draw.rect(SCREEN, COLOR_HUD, floor, 1)
 
         mx, my = pygame.mouse.get_pos()
+        done = False
+        msg = ""
 
-        if is_killer:
+        if not can_task:
+            if not alive:
+                why = "You are out of the game."
+            elif rid in mine:
+                why = "You already finished the task here."
+            else:
+                why = "You finished all your tasks."
+            t = FONT.render(why, True, COLOR_DIM)
+            SCREEN.blit(t, (floor.centerx - t.get_width() // 2, floor.centery - 9))
+        elif is_killer:
             for i, (nx, ny) in enumerate(self.nodes):
                 number = i + 1
                 rect = pygame.Rect(nx - 28, ny - 28, 56, 56)
@@ -500,10 +601,7 @@ class CyberClient:
                     else:
                         self.next_node = 1   # ошибка: начинаем заново
             done = self.next_node > 5
-            if done:
-                msg = "Data stolen! +1 stolen"
-            else:
-                msg = f"Next node: {self.next_node}"
+            msg = "Data stolen! +1 stolen" if done else f"Next node: {self.next_node}"
         else:
             pressed = pygame.mouse.get_pressed()[0] and not self.exit_confirm
             for d in self.dirt:
@@ -521,15 +619,205 @@ class CyberClient:
                 pygame.draw.line(SCREEN, COLOR_TEXT, (mx, my), (mx + 25, my - 45), 4)
                 pygame.draw.rect(SCREEN, COLOR_HUD, (mx - 14, my - 4, 28, 8))
 
-        SCREEN.blit(FONT.render(msg, True, COLOR_GREEN if done else COLOR_TEXT), (270, 435))
+        if msg:
+            SCREEN.blit(FONT.render(msg, True, COLOR_GREEN if done else COLOR_TEXT),
+                        (270, 430))
 
         if done and not self.quest_done:
             self.finish_quest()
             if self.quest_room is None:  # связь потеряна
                 return
 
-        if self.draw_button("Close", 400, 465, 200, 40):
+        # убийца: убить того, кто в этой же комнате
+        if is_killer and alive:
+            others = [p for p in self.room_players(rid)
+                      if p != self.user and p not in lob.get("teammates", [])]
+            if others:
+                if lob.get("can_kill"):
+                    if self.draw_button(f"Kill {others[0]}", 270, 458, 230, 34):
+                        self.do_kill(rid, others[0])
+                else:
+                    SCREEN.blit(SMALL_FONT.render("Kill already used this round",
+                                                  True, COLOR_DIM), (270, 467))
+
+        if self.draw_button("Close", 400, 496, 200, 34):
             self.close_quest()
+            return
+        if body_here and alive:
+            if self.draw_button("Report", 620, 496, 110, 34):
+                self.do_report()
+
+    def draw_kill_panel(self):
+        lob = self.lobby
+        rid = self.kill_room
+        players = self.room_players(rid)
+        victims = [p for p in players if p != self.user
+                   and p not in lob.get("teammates", [])]
+        if len(players) < 2 and not victims:
+            self.kill_room = None
+            return
+
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 170))
+        SCREEN.blit(overlay, (0, 0))
+        pygame.draw.rect(SCREEN, (12, 22, 36), (300, 170, 400, 290))
+        pygame.draw.rect(SCREEN, COLOR_DEV_RED, (300, 170, 400, 290), 2)
+
+        t = FONT.render(f"{ROOM_NAMES.get(rid, 'Room')} is full", True, COLOR_DEV_RED)
+        SCREEN.blit(t, (500 - t.get_width() // 2, 185))
+        t = SMALL_FONT.render("Kill someone inside to take the place", True, COLOR_DIM)
+        SCREEN.blit(t, (500 - t.get_width() // 2, 212))
+
+        y = 250
+        if not victims:
+            SCREEN.blit(SMALL_FONT.render("No targets here", True, COLOR_DIM), (400, y + 8))
+        for name in victims:
+            if lob.get("can_kill"):
+                if self.draw_button(f"Kill {name}", 350, y, 300, 40):
+                    self.do_kill(rid, name)
+                    return
+            else:
+                pygame.draw.rect(SCREEN, COLOR_DARK_BOX, (350, y, 300, 40))
+                pygame.draw.rect(SCREEN, COLOR_DIM, (350, y, 300, 40), 1)
+                t = SMALL_FONT.render("Kill already used this round", True, COLOR_DIM)
+                SCREEN.blit(t, (500 - t.get_width() // 2, y + 11))
+            y += 50
+
+        if self.draw_button("Cancel", 400, 400, 200, 40):
+            self.kill_room = None
+
+    # ---------- голосование ----------
+    def draw_meeting(self):
+        lob = self.lobby
+        m = lob["meeting"]
+        alive = lob.get("alive", True)
+
+        pygame.draw.rect(SCREEN, COLOR_BG, (0, 0, WIDTH, HEIGHT))
+        t = TITLE_FONT.render("EMERGENCY MEETING", True, COLOR_DEV_RED)
+        SCREEN.blit(t, (WIDTH // 2 - t.get_width() // 2, 14))
+        t = SMALL_FONT.render(f"A body was reported by {m['reporter']}", True, COLOR_TEXT)
+        SCREEN.blit(t, (WIDTH // 2 - t.get_width() // 2, 56))
+
+        if m["phase"] == "result":
+            self.draw_meeting_result(m)
+            return
+
+        SCREEN.blit(FONT.render(f"Time left: {m['left']}s", True, COLOR_YELLOW), (790, 26))
+
+        # ---- левая панель: голосование ----
+        pygame.draw.rect(SCREEN, (12, 22, 36), (40, 90, 440, 520))
+        pygame.draw.rect(SCREEN, COLOR_HUD, (40, 90, 440, 520), 2)
+        SCREEN.blit(FONT.render("Who is the deviant?", True, COLOR_HUD), (60, 100))
+
+        cands = m["candidates"]
+        can_vote = m.get("can_vote", False)
+        my_vote = m.get("my_vote")
+        voted = m.get("voted", [])
+
+        if my_vote:
+            info = "You voted: " + ("SKIP" if my_vote == "SKIP" else my_vote)
+        elif can_vote:
+            info = "Choose a player to eject"
+        elif not alive:
+            info = "You are out: you can only watch"
+        else:
+            info = "You cannot vote"
+        SCREEN.blit(SMALL_FONT.render(info, True, COLOR_DIM), (60, 126))
+
+        for i, name in enumerate(cands):
+            x = 60 + (i % 2) * 210
+            y = 155 + (i // 2) * 48
+            if can_vote:
+                if self.draw_button(name, x, y, 200, 40, selected=(my_vote == name)):
+                    self.do_vote(name)
+            else:
+                pygame.draw.rect(SCREEN, COLOR_ACTIVE if my_vote == name else COLOR_DARK_BOX,
+                                 (x, y, 200, 40))
+                pygame.draw.rect(SCREEN, COLOR_DIM, (x, y, 200, 40), 1)
+                t = FONT.render(name, True, COLOR_DIM)
+                SCREEN.blit(t, (x + (200 - t.get_width()) // 2, y + 10))
+            if name in voted:
+                pygame.draw.circle(SCREEN, COLOR_GREEN, (x + 186, y + 20), 5)
+
+        sy = 155 + ((len(cands) + 1) // 2) * 48 + 6
+        if can_vote:
+            if self.draw_button("Skip vote", 60, sy, 200, 40, selected=(my_vote == "SKIP")):
+                self.do_vote("SKIP")
+        else:
+            pygame.draw.rect(SCREEN, COLOR_ACTIVE if my_vote == "SKIP" else COLOR_DARK_BOX,
+                             (60, sy, 200, 40))
+            pygame.draw.rect(SCREEN, COLOR_DIM, (60, sy, 200, 40), 1)
+            t = FONT.render("Skip vote", True, COLOR_DIM)
+            SCREEN.blit(t, (60 + (200 - t.get_width()) // 2, sy + 10))
+        SCREEN.blit(SMALL_FONT.render(f"Votes cast: {len(voted)}", True, COLOR_DIM),
+                    (60, sy + 55))
+        self.draw_room_msg(60, sy + 80)
+
+        # ---- правая панель: чат ----
+        pygame.draw.rect(SCREEN, (12, 22, 36), (500, 90, 460, 520))
+        pygame.draw.rect(SCREEN, COLOR_HUD, (500, 90, 460, 520), 2)
+        SCREEN.blit(FONT.render("Chat", True, COLOR_HUD), (510, 98))
+
+        lines = []
+        for c in m["chat"]:
+            if c["name"] == "SYSTEM":
+                col, text = COLOR_YELLOW, c["text"]
+            else:
+                col = COLOR_HUD if c["name"] == self.user else COLOR_TEXT
+                text = f"{c['name']}: {c['text']}"
+            for part in wrap_lines(text, SMALL_FONT, 435):
+                lines.append((col, part))
+        for i, (col, part) in enumerate(lines[-18:]):
+            SCREEN.blit(SMALL_FONT.render(part, True, col), (510, 128 + i * 20))
+
+        box = pygame.Rect(510, 535, 340, 38)
+        can_chat = alive
+        pygame.draw.rect(SCREEN, COLOR_ACTIVE if can_chat else COLOR_DARK_BOX, box)
+        pygame.draw.rect(SCREEN, COLOR_HUD if can_chat else COLOR_DIM, box, 1)
+        if can_chat:
+            txt = self.chat_input
+            while SMALL_FONT.size(txt + "_")[0] > 320:
+                txt = txt[1:]
+            cursor = "_" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+            SCREEN.blit(SMALL_FONT.render(txt + cursor, True, COLOR_TEXT), (518, 546))
+            if self.draw_button("Send", 860, 535, 90, 38):
+                self.send_chat()
+            SCREEN.blit(SMALL_FONT.render("Type a message and press Enter",
+                                          True, COLOR_DIM), (510, 582))
+        else:
+            SCREEN.blit(SMALL_FONT.render("Dead players cannot chat", True, COLOR_DIM),
+                        (518, 546))
+
+    def draw_meeting_result(self, m):
+        res = m["result"]
+        pygame.draw.rect(SCREEN, (12, 22, 36), (200, 100, 600, 420))
+        pygame.draw.rect(SCREEN, COLOR_YELLOW, (200, 100, 600, 420), 2)
+        t = TITLE_FONT.render("VOTING RESULT", True, COLOR_YELLOW)
+        SCREEN.blit(t, (500 - t.get_width() // 2, 120))
+
+        if res["ejected"]:
+            t = FONT.render(f"{res['ejected']} was ejected.", True, COLOR_TEXT)
+            SCREEN.blit(t, (500 - t.get_width() // 2, 190))
+            if res["deviant"]:
+                t = FONT.render(f"{res['ejected']} WAS A DEVIANT!", True, COLOR_DEV_RED)
+            else:
+                t = FONT.render(f"{res['ejected']} was NOT a deviant.", True, COLOR_GREEN)
+            SCREEN.blit(t, (500 - t.get_width() // 2, 220))
+        else:
+            t = FONT.render("No one was ejected.", True, COLOR_TEXT)
+            SCREEN.blit(t, (500 - t.get_width() // 2, 200))
+
+        SCREEN.blit(SMALL_FONT.render("Votes:", True, COLOR_DIM), (230, 275))
+        tally = sorted(res["tally"].items(), key=lambda kv: -kv[1])[:8]
+        if not tally:
+            SCREEN.blit(SMALL_FONT.render("nobody voted", True, COLOR_DIM), (230, 300))
+        for i, (name, n) in enumerate(tally):
+            label = "Skip" if name == "SKIP" else name
+            SCREEN.blit(SMALL_FONT.render(f"{label}: {n}", True, COLOR_TEXT),
+                        (230, 300 + i * 22))
+
+        t = SMALL_FONT.render(f"Back to the game in {m['left']}s", True, COLOR_DIM)
+        SCREEN.blit(t, (500 - t.get_width() // 2, 490))
 
     # ---------- детектив ----------
     def do_check(self, target):
@@ -556,7 +844,8 @@ class CyberClient:
             f"Round {lob.get('round', 1)} ({lob.get('round_left', 0)}s left). {status}",
             True, COLOR_GREEN if can else COLOR_DIM), (270, 145))
 
-        names = [s["name"] for s in lob["slots"] if s["name"] != self.user]
+        names = [s["name"] for s in lob["slots"]
+                 if s["name"] != self.user and not s.get("dead")]
         for i, name in enumerate(names):
             x = 270 + (i % 2) * 240
             y = 180 + (i // 2) * 46
@@ -614,7 +903,6 @@ class CyberClient:
             SCREEN.blit(FONT.render(self.room_msg, True, COLOR_DEV_RED), (x, y))
 
     def draw_customize(self):
-        # рамка с андроидом слева
         pygame.draw.rect(SCREEN, (12, 22, 36), (60, 90, 380, 500))
         pygame.draw.rect(SCREEN, COLOR_HUD, (60, 90, 380, 500), 2)
 
@@ -634,7 +922,6 @@ class CyberClient:
                 if layer:
                     SCREEN.blit(layer, PREVIEW_POS, PREVIEW_CROP)
 
-        # плитки выбора справа
         SCREEN.blit(FONT.render("Costumes", True, COLOR_HUD), (500, 95))
         SCREEN.blit(SMALL_FONT.render("Click an item to put it on / take it off",
                                       True, COLOR_DIM), (500, 118))
@@ -746,6 +1033,23 @@ class CyberClient:
         if self.draw_button("Continue", 400, 425, 200, 45):
             self.role_seen = True
 
+    def draw_dead_modal(self):
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        SCREEN.blit(overlay, (0, 0))
+        pygame.draw.rect(SCREEN, (12, 22, 36), (230, 190, 540, 250))
+        pygame.draw.rect(SCREEN, COLOR_DEV_RED, (230, 190, 540, 250), 2)
+        t = TITLE_FONT.render("YOU ARE OUT", True, COLOR_DEV_RED)
+        SCREEN.blit(t, (500 - t.get_width() // 2, 210))
+        y = 270
+        for line in wrap_lines("You were killed or ejected from the house. You can watch "
+                               "the game and read the chat, but you can't play anymore.",
+                               SMALL_FONT, 480):
+            SCREEN.blit(SMALL_FONT.render(line, True, COLOR_TEXT), (260, y))
+            y += 24
+        if self.draw_button("Continue", 400, 380, 200, 45):
+            self.dead_seen = True
+
     def draw_win(self):
         lob = self.lobby
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -756,7 +1060,7 @@ class CyberClient:
 
         t = TITLE_FONT.render("ANDROIDS WIN!", True, COLOR_GREEN)
         SCREEN.blit(t, (500 - t.get_width() // 2, 110))
-        t = SMALL_FONT.render("All tasks are complete.", True, COLOR_TEXT)
+        t = SMALL_FONT.render(lob.get("win_reason") or "The androids won.", True, COLOR_TEXT)
         SCREEN.blit(t, (500 - t.get_width() // 2, 155))
         SCREEN.blit(SMALL_FONT.render("Roles:", True, COLOR_DIM), (230, 200))
 
@@ -844,9 +1148,12 @@ class CyberClient:
             return
         lob = self.lobby
         role = lob.get("my_role")
+        alive = lob.get("alive", True)
         draw_map()
 
-        if role:
+        if not alive:
+            SCREEN.blit(FONT.render("YOU ARE OUT (spectating)", True, COLOR_DEV_RED), (20, 42))
+        elif role:
             rname, rcolor, _ = ROLE_INFO[role]
             SCREEN.blit(FONT.render(f"Role: {rname}", True, rcolor), (20, 42))
         SCREEN.blit(SMALL_FONT.render("Click a room to enter", True, COLOR_DIM), (20, 64))
@@ -856,11 +1163,27 @@ class CyberClient:
         if lob.get("winner"):
             self.draw_win()
             return
+        if lob.get("meeting"):
+            self.quest_room = None
+            self.kill_room = None
+            self.check_open = False
+            self.draw_meeting()
+            return
         if role and not self.role_seen:
             self.draw_role_modal()
             return
+        if not alive:
+            self.quest_room = None
+            self.kill_room = None
+            self.check_open = False
+            if not self.dead_seen:
+                self.draw_dead_modal()
+                return
         if self.quest_room is not None:
             self.draw_quest()
+            return
+        if self.kill_room is not None:
+            self.draw_kill_panel()
             return
         if self.check_open:
             self.draw_check_panel()
@@ -870,20 +1193,23 @@ class CyberClient:
             self.leave_lobby()
             return
 
-        if role == "detective":
+        if role == "detective" and alive:
             label = "Check player" if lob.get("can_check") else "Check used"
             if self.draw_button(label, 790, 595, 190, 40):
                 self.check_open = True
                 return
 
         mine_done = lob.get("my_done", [])
+        body_rooms = lob.get("body_rooms", [])
         word = "steal" if role == "killer" else "quest"
         mouse = pygame.mouse.get_pos()
         for r in lob["rooms"]:
             if r["id"] not in QUEST_RECTS:
                 continue
             rect = mrect(*QUEST_RECTS[r["id"]])
-            full = len(r["players"]) >= r["cap"]
+            players = r["players"]
+            cap = r["cap"]
+            full = len(players) >= cap
             is_done = r["id"] in mine_done
             if is_done:
                 color = COLOR_GREEN
@@ -892,16 +1218,32 @@ class CyberClient:
             hover = rect.collidepoint(mouse) and not self.exit_confirm
             pygame.draw.rect(SCREEN, color, rect, 4 if hover else 2)
 
-            cnt = FONT.render(f"{len(r['players'])}/{r['cap']}", True, color)
-            SCREEN.blit(cnt, (rect.centerx - cnt.get_width() // 2, rect.centery - 18))
+            cnt = FONT.render(f"{len(players)}/{cap}", True, color)
+            SCREEN.blit(cnt, (rect.centerx - cnt.get_width() // 2, rect.centery - 34))
             lbl = FONT.render("done" if is_done else word, True,
                               COLOR_GREEN if is_done else COLOR_DIM)
-            SCREEN.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.centery + 4))
+            SCREEN.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.centery - 14))
+
+            # тени тех, кто внутри
+            x0 = rect.centerx - (cap * 26) // 2
+            for i in range(cap):
+                draw_shadow(x0 + i * 26, rect.centery + 8, i < len(players), color)
+
+            # тело (видят убийцы, выбывшие и те, кто в комнате)
+            if r["id"] in body_rooms:
+                bx, by = rect.x + 28, rect.y + 28
+                pygame.draw.line(SCREEN, COLOR_DEV_RED, (bx - 11, by - 11), (bx + 11, by + 11), 5)
+                pygame.draw.line(SCREEN, COLOR_DEV_RED, (bx - 11, by + 11), (bx + 11, by - 11), 5)
 
             if (self.click_pos and not self.exit_confirm
                     and rect.collidepoint(self.click_pos)):
                 self.click_pos = None
-                self.try_enter_room(r["id"])
+                if not alive:
+                    self.show_msg("You are out of the game")
+                elif role == "killer" and full and self.user not in players:
+                    self.kill_room = r["id"]
+                else:
+                    self.try_enter_room(r["id"])
                 break
 
     def render(self):
@@ -1047,6 +1389,14 @@ class CyberClient:
         elif event.unicode.isdigit() and len(self.input_code) < 4:
             self.input_code += event.unicode
 
+    def handle_chat_key(self, event):
+        if event.key == pygame.K_RETURN:
+            self.send_chat()
+        elif event.key == pygame.K_BACKSPACE:
+            self.chat_input = self.chat_input[:-1]
+        elif event.unicode and event.unicode.isprintable() and len(self.chat_input) < 80:
+            self.chat_input += event.unicode
+
     def handle_events(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -1069,3 +1419,7 @@ class CyberClient:
                     self.handle_login_key(event)
                 elif self.current_screen == "JOIN":
                     self.handle_join_key(event)
+                elif (self.current_screen == "GAME" and self.lobby
+                      and (self.lobby.get("meeting") or {}).get("phase") == "vote"
+                      and self.lobby.get("alive", True)):
+                    self.handle_chat_key(event)

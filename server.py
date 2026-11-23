@@ -3,19 +3,22 @@ import threading
 import json
 import random
 import time
+from collections import Counter
 from db_helper import DBHelper
 
-HOST = '0.0.0.0'
+HOST = '127.0.0.1'
 PORT = 5555
 
 DEFAULT_SETTINGS = {"size": 6, "killers": 1, "detectives": 1, "quests": 3}
-BOT_QUEST_SECONDS = 5        # сколько бот "выполняет" задание
-BOT_THINK_RANGE = (2, 5)     # пауза между заданиями бота (сек)
-# номер комнаты: вместимость
-# 1 - башня, 2 - центр, 3 - правая, 4 - терраса, 5 - нижняя
-QUEST_ROOMS = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
 
-ROUND_SECONDS = 60   # длина раунда (для проверки детектива)
+# номер комнаты: вместимость
+QUEST_ROOMS = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
+ROOM_NAMES = {1: "Tower", 2: "Center", 3: "East wing", 4: "Terrace", 5: "South wing"}
+
+ROUND_SECONDS = 60      # длина раунда
+MEETING_SECONDS = 60    # время на голосование
+RESULT_SECONDS = 6      # сколько показывается итог голосования
+CHAT_MAX_LEN = 80
 
 
 class CyberServer:
@@ -29,7 +32,6 @@ class CyberServer:
         self.lobbies = {}          # code -> dict
         self.lobby_lock = threading.Lock()
         print(f"[SERVER STARTED] Сервер запущен на {HOST}:{PORT}...")
-        threading.Thread(target=self.bot_loop, daemon=True).start()
 
     # ---------- вспомогательное ----------
     @staticmethod
@@ -44,50 +46,116 @@ class CyberServer:
                 return code
 
     @staticmethod
-    def current_round(lobby):
-        elapsed = time.time() - lobby["round_start"]
-        return int(elapsed // ROUND_SECONDS) + 1, ROUND_SECONDS - int(elapsed % ROUND_SECONDS)
-
-    @staticmethod
-    @staticmethod
-    def participants(lobby):
-        """Люди + боты (боты появляются после старта)."""
-        return list(lobby["players"]) + list(lobby.get("bots", []))
-
-    @staticmethod
-    def check_win(lobby):
-        if not lobby.get("started") or lobby.get("winner"):
-            return
+    def peace_progress(lobby):
+        """(сделано, всего) по заданиям мирных людей.
+        У выбывших в 'всего' остаётся только то, что они уже сделали."""
         roles = lobby.get("roles", {})
         done = lobby.get("done", {})
-        peace = [p for p in CyberServer.participants(lobby) if roles.get(p) != "killer"]
-        total = len(peace) * lobby["quests"]
-        if total > 0 and sum(len(done.get(p, [])) for p in peace) >= total:
+        dead = lobby.get("dead", set())
+        d = t = 0
+        for p in lobby["players"]:
+            if roles.get(p) == "killer":
+                continue
+            n = len(done.get(p, []))
+            d += n
+            t += n if p in dead else lobby["quests"]
+        return d, t
+
+    def check_win(self, lobby):
+        if not lobby.get("started") or lobby.get("winner") or lobby.get("meeting"):
+            return
+        roles = lobby.get("roles", {})
+        dead = lobby.get("dead", set())
+
+        killers = [n for n, r in roles.items() if r == "killer"]
+        if killers and all(k in dead for k in killers):
             lobby["winner"] = "peaceful"
-            print("[GAME] Мирные победили!")
+            lobby["win_reason"] = "All deviants were ejected."
+            print("[GAME] Мирные победили (все девианты выгнаны)!")
+            return
+
+        d, t = self.peace_progress(lobby)
+        alive_peace = [p for p in lobby["players"]
+                       if roles.get(p) != "killer" and p not in dead]
+        if alive_peace and t > 0 and d >= t:
+            lobby["winner"] = "peaceful"
+            lobby["win_reason"] = "All tasks are complete."
+            print("[GAME] Мирные победили (все задания выполнены)!")
+
+    def resolve_meeting(self, lobby):
+        m = lobby["meeting"]
+        counts = Counter(m["votes"].values())
+        ejected = None
+        if counts:
+            top = counts.most_common()
+            best_name, best_n = top[0]
+            tie = len(top) > 1 and top[1][1] == best_n
+            if best_name != "SKIP" and not tie:
+                ejected = best_name
+        was_deviant = False
+        if ejected:
+            lobby["dead"].add(ejected)
+            lobby["known_dead"].add(ejected)
+            was_deviant = lobby["roles"].get(ejected) == "killer"
+        m["phase"] = "result"
+        m["result_until"] = time.time() + RESULT_SECONDS
+        m["result"] = {"ejected": ejected, "deviant": was_deviant, "tally": dict(counts)}
+        print(f"[MEETING] Выгнан: {ejected} (девиант: {was_deviant})")
+
+    def tick(self, lobby):
+        """Обновляем таймеры раунда и голосования."""
+        if not lobby.get("started") or lobby.get("winner"):
+            return
+        now = time.time()
+        m = lobby.get("meeting")
+        if m:
+            if m["phase"] == "vote":
+                voters = [p for p in lobby["players"] if p not in lobby["dead"]]
+                everyone = bool(voters) and all(p in m["votes"] for p in voters)
+                if everyone or now - m["start"] >= MEETING_SECONDS:
+                    self.resolve_meeting(lobby)
+            elif now >= m["result_until"]:
+                lobby["meeting"] = None
+                lobby["round"] += 1
+                lobby["round_start"] = now
+            return
+        while now - lobby["round_start"] >= ROUND_SECONDS:
+            lobby["round"] += 1
+            lobby["round_start"] += ROUND_SECONDS
+
     def lobby_state(self, code, lobby, user):
+        self.tick(lobby)
         self.check_win(lobby)
+
         started = lobby.get("started", False)
         humans = lobby["players"]
         roles = lobby.get("roles", {})
         done = lobby.get("done", {})
+        dead = lobby.get("dead", set())
+        known = lobby.get("known_dead", set())
+        my_role = roles.get(user)
+        i_dead = user in dead
+        sees_all = i_dead or my_role == "killer"
+        shown_dead = dead if sees_all else known
 
-        slots = [{"name": n, "bot": False, "host": n == lobby["host"]} for n in humans]
         if started:
             bots = lobby.get("bots", [])
         else:
             bots = [f"Bot {i + 1}" for i in range(lobby["size"] - len(humans))]
-        for b in bots:
-            slots.append({"name": b, "bot": True, "host": False})
+        slots = [{"name": n, "bot": False, "host": n == lobby["host"],
+                  "dead": n in shown_dead} for n in humans]
+        slots += [{"name": b, "bot": True, "host": False,
+                   "dead": b in shown_dead} for b in bots]
 
-        # было: peace = [p for p in humans if roles.get(p) != "killer"]
-        peace = [p for p in self.participants(lobby) if roles.get(p) != "killer"]
-        progress = {
-            "done": sum(len(done.get(p, [])) for p in peace),
-            "total": len(peace) * lobby["quests"],
-        }
+        d, t = self.peace_progress(lobby)
+        rooms = lobby.get("rooms", {})
+        bodies = lobby.get("bodies", [])
+        if sees_all:
+            body_rooms = sorted({b["room"] for b in bodies})
+        else:
+            body_rooms = [r for r, pl in rooms.items()
+                          if user in pl and any(b["room"] == r for b in bodies)]
 
-        my_role = roles.get(user)
         state = {
             "code": code,
             "host": lobby["host"],
@@ -97,29 +165,53 @@ class CyberServer:
             "quests": lobby["quests"],
             "started": started,
             "rooms": [
-                {"id": r, "cap": cap, "players": list(lobby.get("rooms", {}).get(r, []))}
+                {"id": r, "cap": cap, "players": list(rooms.get(r, []))}
                 for r, cap in QUEST_ROOMS.items()
             ],
             "my_done": list(done.get(user, [])),
-            "progress": progress,
+            "progress": {"done": d, "total": t},
             "slots": slots,
             "my_role": my_role,
+            "alive": not i_dead,
+            "body_rooms": body_rooms,
             "winner": lobby.get("winner"),
+            "win_reason": lobby.get("win_reason", ""),
         }
 
         if started:
-            rnd, left = self.current_round(lobby)
-            state["round"] = rnd
-            state["round_left"] = left
+            now = time.time()
+            state["round"] = lobby["round"]
+            state["round_left"] = max(0, ROUND_SECONDS - int(now - lobby["round_start"]))
             if my_role == "killer":
                 state["teammates"] = [n for n, r in roles.items()
                                       if r == "killer" and n != user]
+                state["can_kill"] = (not i_dead and
+                                     lobby["kills"].get(user) != lobby["round"])
             if my_role == "detective":
                 checks = lobby.get("checks", {}).get(user, [])
                 state["checks"] = list(checks)
-                state["can_check"] = not any(c["round"] == rnd for c in checks)
+                state["can_check"] = (not i_dead and not lobby.get("meeting") and
+                                      not any(c["round"] == lobby["round"] for c in checks))
             if lobby.get("winner"):
                 state["reveal"] = dict(roles)
+
+            m = lobby.get("meeting")
+            if m:
+                cands = [n for n in humans + bots if n not in dead and n != user]
+                ms = {
+                    "phase": m["phase"],
+                    "reporter": m["reporter"],
+                    "candidates": cands,
+                    "my_vote": m["votes"].get(user),
+                    "voted": sorted(m["votes"].keys()),
+                    "chat": m["chat"][-40:],
+                    "can_vote": (not i_dead) and user in humans and user not in m["votes"],
+                    "left": int(max(0, MEETING_SECONDS - (now - m["start"]))),
+                }
+                if m["phase"] == "result":
+                    ms["result"] = m["result"]
+                    ms["left"] = int(max(0, m["result_until"] - now))
+                state["meeting"] = ms
         return state
 
     def find_lobby(self, username):
@@ -243,11 +335,10 @@ class CyberServer:
                         else:
                             roles[n] = "peaceful"
                     lobby.update(started=True, bots=bots, roles=roles,
-                                 done={p: [] for p in names},  # было: humans
-                                 round_start=time.time(), checks={},
-                                 bot_state={b: {"room": None,
-                                                "next_at": time.time() + random.uniform(*BOT_THINK_RANGE)}
-                                            for b in bots})
+                                 done={p: [] for p in humans},
+                                 rooms={}, checks={}, kills={},
+                                 dead=set(), known_dead=set(), bodies=[],
+                                 meeting=None, round=1, round_start=time.time())
                     print(f"[LOBBY] {user} запустил игру в лобби {code}")
                     print(f"[ROLES] {roles}")
                 return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
@@ -262,14 +353,13 @@ class CyberServer:
                 if action == "enter_room":
                     if lobby.get("winner"):
                         return {"status": False, "msg": "Игра окончена!"}
+                    if lobby.get("meeting"):
+                        return {"status": False, "msg": "Идёт голосование!"}
+                    if user in lobby.get("dead", set()):
+                        return {"status": False, "msg": "Вы выбыли из игры!"}
                     rid = int(msg.get("room", -1))
                     if rid not in QUEST_ROOMS:
                         return {"status": False, "msg": "Нет такой комнаты"}
-                    mine = lobby.get("done", {}).get(user, [])
-                    if rid in mine:
-                        return {"status": False, "msg": "Вы уже выполнили здесь задание!"}
-                    if len(mine) >= lobby["quests"]:
-                        return {"status": False, "msg": "Вы выполнили все свои задания!"}
                     others = [p for p in rooms.get(rid, []) if p != user]
                     if len(others) >= QUEST_ROOMS[rid]:
                         return {"status": False, "msg": "Комната занята!"}
@@ -285,8 +375,10 @@ class CyberServer:
                 code, lobby = self.find_lobby(user)
                 if not lobby:
                     return {"status": False, "closed": True, "msg": "Вы не в лобби"}
-                if lobby.get("winner"):
-                    return {"status": False, "msg": "Игра окончена!"}
+                if lobby.get("winner") or lobby.get("meeting"):
+                    return {"status": False, "msg": "Сейчас нельзя!"}
+                if user in lobby.get("dead", set()):
+                    return {"status": False, "msg": "Вы выбыли из игры!"}
                 rid = int(msg.get("room", -1))
                 if user not in lobby.get("rooms", {}).get(rid, []):
                     return {"status": False, "msg": "Вы не в этой комнате!"}
@@ -296,20 +388,116 @@ class CyberServer:
                     print(f"[QUEST] {user} выполнил задание в комнате {rid}")
                 return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
 
+        if action == "kill":
+            with self.lobby_lock:
+                code, lobby = self.find_lobby(user)
+                if not lobby or not lobby.get("started"):
+                    return {"status": False, "msg": "Игра не идёт"}
+                if lobby.get("winner") or lobby.get("meeting"):
+                    return {"status": False, "msg": "Сейчас нельзя!"}
+                roles = lobby["roles"]
+                if roles.get(user) != "killer" or user in lobby["dead"]:
+                    return {"status": False, "msg": "Вы не можете убивать!"}
+                rid = int(msg.get("room", -1))
+                target = str(msg.get("target", ""))
+                rooms = lobby.setdefault("rooms", {})
+                if rid not in QUEST_ROOMS or target == user or target not in rooms.get(rid, []):
+                    return {"status": False, "msg": "Цели нет в этой комнате!"}
+                if roles.get(target) == "killer":
+                    return {"status": False, "msg": "Нельзя убить своего!"}
+                if lobby["kills"].get(user) == lobby["round"]:
+                    return {"status": False, "msg": "Одно убийство за раунд!"}
+
+                rooms[rid].remove(target)
+                lobby["dead"].add(target)
+                lobby["bodies"].append({"name": target, "room": rid})
+                lobby["kills"][user] = lobby["round"]
+                print(f"[KILL] {user} убил {target} в комнате {rid}")
+
+                entered = False
+                if user in rooms[rid]:
+                    entered = True
+                elif len(rooms[rid]) < QUEST_ROOMS[rid]:
+                    for pl in rooms.values():
+                        if user in pl:
+                            pl.remove(user)
+                    rooms[rid].append(user)
+                    entered = True
+                return {"status": True, "entered": entered,
+                        "lobby": self.lobby_state(code, lobby, user)}
+
+        if action == "report":
+            with self.lobby_lock:
+                code, lobby = self.find_lobby(user)
+                if not lobby or not lobby.get("started"):
+                    return {"status": False, "msg": "Игра не идёт"}
+                if lobby.get("winner") or lobby.get("meeting"):
+                    return {"status": False, "msg": "Сейчас нельзя!"}
+                if user in lobby["dead"]:
+                    return {"status": False, "msg": "Вы выбыли из игры!"}
+                rooms = lobby.setdefault("rooms", {})
+                bodies = lobby["bodies"]
+                rid = next((r for r, pl in rooms.items()
+                            if user in pl and any(b["room"] == r for b in bodies)), None)
+                if rid is None:
+                    return {"status": False, "msg": "Здесь нет тела!"}
+                names = [b["name"] for b in bodies]
+                lobby["known_dead"].update(names)
+                lobby["bodies"] = []
+                for pl in rooms.values():
+                    pl.clear()
+                lobby["meeting"] = {
+                    "phase": "vote", "start": time.time(), "reporter": user,
+                    "room": rid, "votes": {},
+                    "chat": [{"name": "SYSTEM",
+                              "text": f"{user} found a body in the {ROOM_NAMES[rid]}. "
+                                      f"Victims: {', '.join(names)}."}],
+                }
+                print(f"[MEETING] {user} сообщил о теле в комнате {rid}")
+                return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
+
+        if action in ("vote", "chat"):
+            with self.lobby_lock:
+                code, lobby = self.find_lobby(user)
+                if not lobby:
+                    return {"status": False, "closed": True, "msg": "Вы не в лобби"}
+                self.tick(lobby)
+                m = lobby.get("meeting")
+                if not m or m["phase"] != "vote":
+                    return {"status": False, "msg": "Голосование не идёт"}
+                if user in lobby["dead"]:
+                    return {"status": False, "msg": "Вы выбыли из игры!"}
+                if action == "vote":
+                    if user in m["votes"]:
+                        return {"status": False, "msg": "Вы уже проголосовали!"}
+                    target = str(msg.get("target", ""))
+                    names = lobby["players"] + lobby.get("bots", [])
+                    if target != "SKIP" and (target == user or target not in names
+                                             or target in lobby["dead"]):
+                        return {"status": False, "msg": "Нельзя голосовать за этого игрока"}
+                    m["votes"][user] = target
+                else:
+                    text = str(msg.get("text", "")).strip()[:CHAT_MAX_LEN]
+                    if not text:
+                        return {"status": False, "msg": "Пустое сообщение"}
+                    m["chat"].append({"name": user, "text": text})
+                    del m["chat"][:-100]
+                return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
+
         if action == "check_player":
             with self.lobby_lock:
                 code, lobby = self.find_lobby(user)
                 if not lobby or not lobby.get("started"):
                     return {"status": False, "closed": not lobby, "msg": "Игра не идёт"}
-                if lobby.get("winner"):
-                    return {"status": False, "msg": "Игра окончена!"}
+                if lobby.get("winner") or lobby.get("meeting"):
+                    return {"status": False, "msg": "Сейчас нельзя!"}
                 roles = lobby["roles"]
-                if roles.get(user) != "detective":
-                    return {"status": False, "msg": "Вы не детектив!"}
+                if roles.get(user) != "detective" or user in lobby["dead"]:
+                    return {"status": False, "msg": "Вы не можете проверять!"}
                 target = str(msg.get("target", ""))
-                if target == user or target not in roles:
+                if target == user or target not in roles or target in lobby["known_dead"]:
                     return {"status": False, "msg": "Нельзя проверить этого игрока"}
-                rnd, _ = self.current_round(lobby)
+                rnd = lobby["round"]
                 checks = lobby.setdefault("checks", {}).setdefault(user, [])
                 if any(c["round"] == rnd for c in checks):
                     return {"status": False, "msg": "В этом раунде проверка уже использована!"}
@@ -348,55 +536,6 @@ class CyberServer:
                 return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
 
         return {"status": False, "msg": "Неизвестное действие"}
-
-    def bot_tick(self):
-        now = time.time()
-        with self.lobby_lock:
-            for lobby in list(self.lobbies.values()):
-                if not lobby.get("started") or lobby.get("winner"):
-                    continue
-                rooms = lobby.setdefault("rooms", {})
-                done = lobby.setdefault("done", {})
-                for bot, st in lobby.get("bot_state", {}).items():
-                    if now < st["next_at"]:
-                        continue
-
-                    rid = st["room"]
-                    if rid is not None:
-                        # прошло 5 секунд -> "complete_quest" + освободить комнату
-                        if bot in rooms.get(rid, []):
-                            rooms[rid].remove(bot)
-                        mine = done.setdefault(bot, [])
-                        if rid not in mine and len(mine) < lobby["quests"]:
-                            mine.append(rid)
-                            print(f"[BOT QUEST] {bot} выполнил задание в комнате {rid}")
-                        st["room"] = None
-                        st["next_at"] = now + random.uniform(*BOT_THINK_RANGE)
-                        self.check_win(lobby)
-                        if lobby.get("winner"):
-                            break
-                        continue
-
-                    # бот свободен -> ищем пустую комнату 0/1, где он ещё не был
-                    mine = done.setdefault(bot, [])
-                    if len(mine) >= lobby["quests"]:
-                        continue
-                    free = [r for r, cap in QUEST_ROOMS.items()
-                            if cap == 1 and r not in mine and not rooms.get(r)]
-                    if not free:
-                        continue
-                    rid = random.choice(free)
-                    rooms.setdefault(rid, []).append(bot)  # "замок" комнаты
-                    st["room"] = rid
-                    st["next_at"] = now + BOT_QUEST_SECONDS
-
-    def bot_loop(self):
-        while True:
-            time.sleep(1)
-            try:
-                self.bot_tick()
-            except Exception as e:
-                print(f"[BOT ERROR] {e}")
 
     # ---------- клиенты ----------
     def handle_client(self, conn, addr):
