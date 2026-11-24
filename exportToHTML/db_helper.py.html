@@ -1,0 +1,82 @@
+<html>
+<head>
+<title>db_helper.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+db_helper.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">sqlite3</span>
+<span class="s0">import </span><span class="s1">hashlib</span>
+<span class="s0">import </span><span class="s1">hmac</span>
+<span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">threading</span>
+
+
+<span class="s0">class </span><span class="s1">DBHelper</span><span class="s2">:</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">db_name</span><span class="s2">=</span><span class="s3">&quot;cybermafia.db&quot;</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">conn </span><span class="s2">= </span><span class="s1">sqlite3</span><span class="s2">.</span><span class="s1">connect</span><span class="s2">(</span><span class="s1">db_name</span><span class="s2">, </span><span class="s1">check_same_thread</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">lock </span><span class="s2">= </span><span class="s1">threading</span><span class="s2">.</span><span class="s1">Lock</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">create_tables</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">create_tables</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lock</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">.</span><span class="s1">execute</span><span class="s2">(</span><span class="s3">&quot;&quot;&quot; 
+                            CREATE TABLE IF NOT EXISTS users ( 
+                                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                                username TEXT UNIQUE NOT NULL, 
+                                password_hash TEXT NOT NULL, 
+                                salt TEXT NOT NULL, 
+                                skin TEXT DEFAULT 'RK800' 
+                            ) 
+                        &quot;&quot;&quot;</span><span class="s2">)</span>
+
+    <span class="s2">@</span><span class="s1">staticmethod</span>
+    <span class="s0">def </span><span class="s1">_hash</span><span class="s2">(</span><span class="s1">password</span><span class="s2">, </span><span class="s1">salt</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">hashlib</span><span class="s2">.</span><span class="s1">pbkdf2_hmac</span><span class="s2">(</span>
+            <span class="s3">&quot;sha256&quot;</span><span class="s2">, </span><span class="s1">password</span><span class="s2">.</span><span class="s1">encode</span><span class="s2">(</span><span class="s3">&quot;utf-8&quot;</span><span class="s2">), </span><span class="s1">salt</span><span class="s2">, </span><span class="s4">100_000</span>
+        <span class="s2">).</span><span class="s1">hex</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">register_or_login</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">username</span><span class="s2">, </span><span class="s1">password</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lock</span><span class="s2">:</span>
+            <span class="s1">cur </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">.</span><span class="s1">cursor</span><span class="s2">()</span>
+            <span class="s1">cur</span><span class="s2">.</span><span class="s1">execute</span><span class="s2">(</span>
+                <span class="s3">&quot;SELECT password_hash, salt, skin FROM users WHERE username = ?&quot;</span><span class="s2">,</span>
+                <span class="s2">(</span><span class="s1">username</span><span class="s2">,),</span>
+            <span class="s2">)</span>
+            <span class="s1">row </span><span class="s2">= </span><span class="s1">cur</span><span class="s2">.</span><span class="s1">fetchone</span><span class="s2">()</span>
+
+            <span class="s0">if </span><span class="s1">row</span><span class="s2">:</span>
+                <span class="s1">pw_hash</span><span class="s2">, </span><span class="s1">salt_hex</span><span class="s2">, </span><span class="s1">skin </span><span class="s2">= </span><span class="s1">row</span>
+                <span class="s1">check </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_hash</span><span class="s2">(</span><span class="s1">password</span><span class="s2">, </span><span class="s1">bytes</span><span class="s2">.</span><span class="s1">fromhex</span><span class="s2">(</span><span class="s1">salt_hex</span><span class="s2">))</span>
+                <span class="s0">if </span><span class="s1">hmac</span><span class="s2">.</span><span class="s1">compare_digest</span><span class="s2">(</span><span class="s1">check</span><span class="s2">, </span><span class="s1">pw_hash</span><span class="s2">):</span>
+                    <span class="s0">return True</span><span class="s2">, </span><span class="s1">skin</span><span class="s2">, </span><span class="s3">&quot;Успешный вход!&quot;</span>
+                <span class="s0">return False</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s3">&quot;Неверный пароль!&quot;</span>
+
+            <span class="s1">salt </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">urandom</span><span class="s2">(</span><span class="s4">16</span><span class="s2">)</span>
+            <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">:</span>
+                <span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">.</span><span class="s1">execute</span><span class="s2">(</span>
+                    <span class="s3">&quot;INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)&quot;</span><span class="s2">,</span>
+                    <span class="s2">(</span><span class="s1">username</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_hash</span><span class="s2">(</span><span class="s1">password</span><span class="s2">, </span><span class="s1">salt</span><span class="s2">), </span><span class="s1">salt</span><span class="s2">.</span><span class="s1">hex</span><span class="s2">()),</span>
+                <span class="s2">)</span>
+            <span class="s0">return True</span><span class="s2">, </span><span class="s3">&quot;RK800&quot;</span><span class="s2">, </span><span class="s3">&quot;Аккаунт создан!&quot;</span>
+
+    <span class="s0">def </span><span class="s1">update_skin</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">username</span><span class="s2">, </span><span class="s1">skin_name</span><span class="s2">):</span>
+        <span class="s0">with </span><span class="s1">self</span><span class="s2">.</span><span class="s1">lock</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">conn</span><span class="s2">.</span><span class="s1">execute</span><span class="s2">(</span>
+                <span class="s3">&quot;UPDATE users SET skin = ? WHERE username = ?&quot;</span><span class="s2">, (</span><span class="s1">skin_name</span><span class="s2">, </span><span class="s1">username</span><span class="s2">)</span>
+            <span class="s2">)</span>
+
+</pre>
+</body>
+</html>

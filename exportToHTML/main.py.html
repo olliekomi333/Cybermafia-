@@ -1,0 +1,62 @@
+<html>
+<head>
+<title>main.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #2aacb8;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+main.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">os</span>
+<span class="s0">import </span><span class="s1">multiprocessing</span>
+
+<span class="s1">NUM_PLAYERS </span><span class="s2">= </span><span class="s3">2  </span><span class="s4"># כמה משתמשים (חלונות) לפתוח</span>
+
+
+<span class="s0">def </span><span class="s1">run_client</span><span class="s2">(</span><span class="s1">player_num</span><span class="s2">):</span>
+    <span class="s4"># מיקום שונה לכל חלון כדי שלא יפתחו אחד על השני</span>
+    <span class="s1">x </span><span class="s2">= </span><span class="s3">40 </span><span class="s2">+ (</span><span class="s1">player_num </span><span class="s2">- </span><span class="s3">1</span><span class="s2">) * </span><span class="s3">80</span>
+    <span class="s1">y </span><span class="s2">= </span><span class="s3">40 </span><span class="s2">+ (</span><span class="s1">player_num </span><span class="s2">- </span><span class="s3">1</span><span class="s2">) * </span><span class="s3">60</span>
+    <span class="s1">os</span><span class="s2">.</span><span class="s1">environ</span><span class="s2">[</span><span class="s5">&quot;SDL_VIDEO_WINDOW_POS&quot;</span><span class="s2">] = </span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">x</span><span class="s0">}</span><span class="s5">,</span><span class="s0">{</span><span class="s1">y</span><span class="s0">}</span><span class="s5">&quot;</span>
+
+    <span class="s4"># חשוב: מייבאים את client רק כאן, בתוך התהליך של כל משתמש.</span>
+    <span class="s4"># client יוצר את החלון כבר בזמן ה-import, אז כל תהליך יקבל חלון משלו.</span>
+    <span class="s0">import </span><span class="s1">pygame</span>
+    <span class="s0">from </span><span class="s1">client </span><span class="s0">import </span><span class="s1">CyberClient</span>
+
+    <span class="s1">pygame</span><span class="s2">.</span><span class="s1">display</span><span class="s2">.</span><span class="s1">set_caption</span><span class="s2">(</span><span class="s5">f&quot;Cyber-Mafia — Detroit Edition  |  Player </span><span class="s0">{</span><span class="s1">player_num</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s2">)</span>
+
+    <span class="s1">clock </span><span class="s2">= </span><span class="s1">pygame</span><span class="s2">.</span><span class="s1">time</span><span class="s2">.</span><span class="s1">Clock</span><span class="s2">()</span>
+    <span class="s1">app </span><span class="s2">= </span><span class="s1">CyberClient</span><span class="s2">()</span>
+
+    <span class="s0">while True</span><span class="s2">:</span>
+        <span class="s1">app</span><span class="s2">.</span><span class="s1">handle_events</span><span class="s2">()</span>
+        <span class="s1">app</span><span class="s2">.</span><span class="s1">render</span><span class="s2">()</span>
+        <span class="s1">clock</span><span class="s2">.</span><span class="s1">tick</span><span class="s2">(</span><span class="s3">60</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">main</span><span class="s2">():</span>
+    <span class="s1">processes </span><span class="s2">= []</span>
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s3">1</span><span class="s2">, </span><span class="s1">NUM_PLAYERS </span><span class="s2">+ </span><span class="s3">1</span><span class="s2">):</span>
+        <span class="s1">p </span><span class="s2">= </span><span class="s1">multiprocessing</span><span class="s2">.</span><span class="s1">Process</span><span class="s2">(</span><span class="s1">target</span><span class="s2">=</span><span class="s1">run_client</span><span class="s2">, </span><span class="s1">args</span><span class="s2">=(</span><span class="s1">i</span><span class="s2">,))</span>
+        <span class="s1">p</span><span class="s2">.</span><span class="s1">start</span><span class="s2">()</span>
+        <span class="s1">processes</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">p</span><span class="s2">)</span>
+
+    <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">processes</span><span class="s2">:</span>
+        <span class="s1">p</span><span class="s2">.</span><span class="s1">join</span><span class="s2">()</span>
+
+
+<span class="s0">if </span><span class="s1">__name__ </span><span class="s2">== </span><span class="s5">&quot;__main__&quot;</span><span class="s2">:</span>
+    <span class="s1">main</span><span class="s2">()</span></pre>
+</body>
+</html>
