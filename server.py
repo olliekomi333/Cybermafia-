@@ -15,7 +15,7 @@ DEFAULT_SETTINGS = {"size": 6, "killers": 1, "detectives": 1, "quests": 3}
 QUEST_ROOMS = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
 ROOM_NAMES = {1: "Tower", 2: "Center", 3: "East wing", 4: "Terrace", 5: "South wing"}
 
-ROUND_SECONDS = 60      # длина раунда
+ROUND_SECONDS = 60      # длина раунда (в конце раунда автоматически голосование)
 MEETING_SECONDS = 60    # время на голосование
 RESULT_SECONDS = 6      # сколько показывается итог голосования
 CHAT_MAX_LEN = 80
@@ -82,6 +82,29 @@ class CyberServer:
             lobby["win_reason"] = "All tasks are complete."
             print("[GAME] Мирные победили (все задания выполнены)!")
 
+    def start_meeting(self, lobby, reporter=None, room=None):
+        """Начать голосование: по репорту тела (reporter) или по концу раунда (None)."""
+        rooms = lobby.setdefault("rooms", {})
+        names = [b["name"] for b in lobby.get("bodies", [])]
+        lobby["known_dead"].update(names)
+        lobby["bodies"] = []
+        for pl in rooms.values():
+            pl.clear()
+
+        if reporter:
+            text = (f"{reporter} found a body in the {ROOM_NAMES[room]}. "
+                    f"Victims: {', '.join(names)}.")
+        elif names:
+            text = f"The round is over. Victims: {', '.join(names)}."
+        else:
+            text = "The round is over. Nobody was found dead."
+
+        lobby["meeting"] = {
+            "phase": "vote", "start": time.time(), "reporter": reporter,
+            "room": room, "votes": {},
+            "chat": [{"name": "SYSTEM", "text": text}],
+        }
+
     def resolve_meeting(self, lobby):
         m = lobby["meeting"]
         counts = Counter(m["votes"].values())
@@ -119,9 +142,10 @@ class CyberServer:
                 lobby["round"] += 1
                 lobby["round_start"] = now
             return
-        while now - lobby["round_start"] >= ROUND_SECONDS:
-            lobby["round"] += 1
-            lobby["round_start"] += ROUND_SECONDS
+        # раунд закончился по времени -> автоматическое голосование
+        if now - lobby["round_start"] >= ROUND_SECONDS:
+            self.start_meeting(lobby, None)
+            print(f"[MEETING] Раунд {lobby['round']} закончился по времени")
 
     def lobby_state(self, code, lobby, user):
         self.tick(lobby)
@@ -150,11 +174,9 @@ class CyberServer:
         d, t = self.peace_progress(lobby)
         rooms = lobby.get("rooms", {})
         bodies = lobby.get("bodies", [])
-        if sees_all:
-            body_rooms = sorted({b["room"] for b in bodies})
-        else:
-            body_rooms = [r for r, pl in rooms.items()
-                          if user in pl and any(b["room"] == r for b in bodies)]
+        # тело видит только тот, кто сейчас находится в этой комнате
+        body_rooms = [r for r, pl in rooms.items()
+                      if user in pl and any(b["room"] == r for b in bodies)]
 
         state = {
             "code": code,
@@ -324,7 +346,7 @@ class CyberServer:
                     humans = list(lobby["players"])
                     bots = [f"Bot {i + 1}" for i in range(lobby["size"] - len(humans))]
                     names = humans + bots
-                    random.shuffle(names)
+
                     k, d = lobby["killers"], lobby["detectives"]
                     roles = {}
                     for i, n in enumerate(names):
@@ -441,18 +463,7 @@ class CyberServer:
                             if user in pl and any(b["room"] == r for b in bodies)), None)
                 if rid is None:
                     return {"status": False, "msg": "Здесь нет тела!"}
-                names = [b["name"] for b in bodies]
-                lobby["known_dead"].update(names)
-                lobby["bodies"] = []
-                for pl in rooms.values():
-                    pl.clear()
-                lobby["meeting"] = {
-                    "phase": "vote", "start": time.time(), "reporter": user,
-                    "room": rid, "votes": {},
-                    "chat": [{"name": "SYSTEM",
-                              "text": f"{user} found a body in the {ROOM_NAMES[rid]}. "
-                                      f"Victims: {', '.join(names)}."}],
-                }
+                self.start_meeting(lobby, user, rid)
                 print(f"[MEETING] {user} сообщил о теле в комнате {rid}")
                 return {"status": True, "lobby": self.lobby_state(code, lobby, user)}
 

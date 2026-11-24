@@ -92,6 +92,44 @@ def load_assets():
 
 ASSET_LAYERS, ASSET_THUMBS, ASSET_MISSING = load_assets()
 
+# ---------------- ТЕНЬ В КОМНАТАХ ----------------
+SHADOW_H = 42   # высота тени на карте (пиксели)
+
+
+def load_shadow():
+    """Тень из assets/shadow.png, обрезанная по содержимому."""
+    try:
+        img = pygame.image.load(os.path.join(ASSET_DIR, "shadow.png")).convert_alpha()
+    except Exception:
+        return None
+    box = img.get_bounding_rect()
+    if box.w <= 0 or box.h <= 0:
+        return None
+    crop = img.subsurface(box).copy()
+    k = SHADOW_H / box.h
+    return pygame.transform.smoothscale(crop, (max(1, int(box.w * k)), SHADOW_H))
+
+
+SHADOW_IMG = load_shadow()
+
+
+def draw_shadows(cx, top, count):
+    """Рисует тени по центру cx: 0, 1 или 2 (других вариантов нет)."""
+    count = max(0, min(count, 2))
+    if count == 0:
+        return
+    w = SHADOW_IMG.get_width() if SHADOW_IMG else 22
+    gap = 10
+    x = cx - (count * w + (count - 1) * gap) // 2
+    for _ in range(count):
+        if SHADOW_IMG:
+            SCREEN.blit(SHADOW_IMG, (x, top))
+        else:  # запасной силуэт, если shadow.png не найден
+            pygame.draw.circle(SCREEN, (4, 7, 12), (x + 11, top + 7), 7)
+            pygame.draw.ellipse(SCREEN, (4, 7, 12), (x + 2, top + 16, 18, 26))
+        x += w + gap
+
+
 # ---------------- КАРТА ----------------
 MAP_S = 0.737
 MAP_OX = 140
@@ -153,19 +191,6 @@ def wrap_lines(text, font, max_w):
     if cur:
         lines.append(cur)
     return lines
-
-
-def draw_shadow(x, y, filled, edge):
-    """Силуэт человека: закрашенный (занято) или только контур (свободно)."""
-    if filled:
-        pygame.draw.circle(SCREEN, (4, 7, 12), (x + 11, y + 6), 6)
-        pygame.draw.ellipse(SCREEN, (4, 7, 12), (x + 2, y + 14, 18, 22))
-        pygame.draw.circle(SCREEN, edge, (x + 11, y + 6), 6, 1)
-        pygame.draw.ellipse(SCREEN, edge, (x + 2, y + 14, 18, 22), 1)
-    else:
-        dim = (70, 92, 115)
-        pygame.draw.circle(SCREEN, dim, (x + 11, y + 6), 6, 1)
-        pygame.draw.ellipse(SCREEN, dim, (x + 2, y + 14, 18, 22), 1)
 
 
 def draw_map():
@@ -695,7 +720,10 @@ class CyberClient:
         pygame.draw.rect(SCREEN, COLOR_BG, (0, 0, WIDTH, HEIGHT))
         t = TITLE_FONT.render("EMERGENCY MEETING", True, COLOR_DEV_RED)
         SCREEN.blit(t, (WIDTH // 2 - t.get_width() // 2, 14))
-        t = SMALL_FONT.render(f"A body was reported by {m['reporter']}", True, COLOR_TEXT)
+        reporter = m.get("reporter")
+        head = (f"A body was reported by {reporter}" if reporter
+                else "The round time is over")
+        t = SMALL_FONT.render(head, True, COLOR_TEXT)
         SCREEN.blit(t, (WIDTH // 2 - t.get_width() // 2, 56))
 
         if m["phase"] == "result":
@@ -1200,7 +1228,6 @@ class CyberClient:
                 return
 
         mine_done = lob.get("my_done", [])
-        body_rooms = lob.get("body_rooms", [])
         word = "steal" if role == "killer" else "quest"
         mouse = pygame.mouse.get_pos()
         for r in lob["rooms"]:
@@ -1224,16 +1251,8 @@ class CyberClient:
                               COLOR_GREEN if is_done else COLOR_DIM)
             SCREEN.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.centery - 14))
 
-            # тени тех, кто внутри
-            x0 = rect.centerx - (cap * 26) // 2
-            for i in range(cap):
-                draw_shadow(x0 + i * 26, rect.centery + 8, i < len(players), color)
-
-            # тело (видят убийцы, выбывшие и те, кто в комнате)
-            if r["id"] in body_rooms:
-                bx, by = rect.x + 28, rect.y + 28
-                pygame.draw.line(SCREEN, COLOR_DEV_RED, (bx - 11, by - 11), (bx + 11, by + 11), 5)
-                pygame.draw.line(SCREEN, COLOR_DEV_RED, (bx - 11, by + 11), (bx + 11, by - 11), 5)
+            # тени тех, кто внутри: нет теней / одна / две
+            draw_shadows(rect.centerx, rect.centery + 6, len(players))
 
             if (self.click_pos and not self.exit_confirm
                     and rect.collidepoint(self.click_pos)):
